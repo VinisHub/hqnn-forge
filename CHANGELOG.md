@@ -612,6 +612,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--patience` ends in a command-line error), and a dataset name outside `DATASETS` raises a
   `ValueError` listing the allowed names instead of `tuple.index(x): x not in tuple`
   (#540, #605, #606)
+- `examples/benchmark_rydberg_features.py`: checking `--out` no longer opens FIFOs or
+  devices, and valid long output filenames are accepted without making the temporary
+  probe name too long (#628)  
 
 ### Removed
 - `PCANormalizer`'s `copy` option, which never had an effect (#77)
