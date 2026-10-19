@@ -326,6 +326,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import itertools
 import json
@@ -2154,11 +2155,15 @@ def check_writable(out: str | os.PathLike[str]) -> None:
     """
     Refuse an ``out`` that cannot be written, and change nothing.
 
-    An existing file is opened for appending and closed without a write, so
-    its content stays as it is; for a new one a temporary file is created in
-    its directory and removed.  Either raises what writing ``out`` would,
-    here, as a ``ValueError`` naming ``out``: a missing directory, a
-    directory in its place, no write permission.
+    An existing regular file is opened for appending and closed without a
+    write, so its content stays as it is.  Other existing targets, except
+    directories, are checked with ``os.access`` without opening them: opening
+    a FIFO would interfere with its reader.  For a new file a short-named
+    temporary file is created in its directory and removed; the output
+    basename's byte length is checked against ``PC_NAME_MAX`` where available.  An
+    unavailable filesystem limit is ignored.  Errors become a ``ValueError``
+    naming ``out``: a missing directory, a directory in its place, no write
+    permission, or a name that is too long.
 
     Checked up front rather than by writing to a temporary file renamed over
     ``out`` at the end: :func:`run` writes each record as it comes, so that
@@ -2169,12 +2174,21 @@ def check_writable(out: str | os.PathLike[str]) -> None:
     """
     path = Path(out)
     try:
+        if path.exists() and not (path.is_file() or path.is_dir()):
+            if not os.access(path, os.W_OK):
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
         # A broken symlink counts as existing: opening it fails here, not at the first record.
-        if path.exists() or path.is_symlink():
+        elif path.exists() or path.is_symlink():
             with open(path, "a", encoding="utf-8"):
                 pass
         else:
-            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}."):
+            try:
+                name_max = os.pathconf(path.parent, "PC_NAME_MAX")
+            except (AttributeError, OSError, ValueError):
+                name_max = -1
+            if name_max > 0 and len(os.fsencode(path.name)) > name_max:
+                raise OSError(errno.ENAMETOOLONG, os.strerror(errno.ENAMETOOLONG), str(path))
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".out."):
                 pass
     except OSError as error:
         reason = error.strerror or str(error)

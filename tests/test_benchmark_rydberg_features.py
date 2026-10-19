@@ -28,6 +28,7 @@ What the numbers are checked against:
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -36,7 +37,9 @@ import os
 import re
 import sys
 import warnings
+from concurrent.futures import Future
 from pathlib import Path
+from threading import Thread
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -953,6 +956,138 @@ class TestUciData:
 # ---------------------------------------------------------------------------
 # The command line: what a failing or noisy run leaves behind
 # ---------------------------------------------------------------------------
+
+
+class TestCheckWritable:
+    @pytest.mark.may_skip
+    @pytest.mark.skipif(os.name != "posix", reason="named pipes require POSIX")
+    def test_a_fifo_probe_returns_without_a_reader(self, tmp_path: Path) -> None:
+        """Exercise the real probe, with a deadline even if it starts opening the FIFO."""
+        out = tmp_path / "log"
+        os.mkfifo(out)
+        result: Future[None] = Future()
+
+        def check() -> None:
+            try:
+                bench.check_writable(out)
+            except BaseException as error:  # noqa: BLE001 - re-raise in the test thread
+                result.set_exception(error)
+            else:
+                result.set_result(None)
+
+        worker = Thread(target=check, daemon=True)
+        worker.start()
+        try:
+            result.result(timeout=2)
+        finally:
+            if not result.done():
+                # Release a writer blocked by a regression so it cannot leak into later tests.
+                reader = os.open(out, os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    worker.join(timeout=2)
+                finally:
+                    os.close(reader)
+            else:
+                worker.join(timeout=2)
+        assert not worker.is_alive()
+
+    @pytest.mark.may_skip
+    @pytest.mark.skipif(os.name != "posix", reason="named pipes require POSIX")
+    @pytest.mark.parametrize("symlink", [False, True])
+    @pytest.mark.parametrize("writable", [False, True])
+    def test_a_fifo_is_checked_without_opening_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, symlink: bool, writable: bool
+    ) -> None:
+        """#625: opening a FIFO without a reader would hang instead of failing the test."""
+        fifo = tmp_path / "log"
+        os.mkfifo(fifo)
+        out = fifo
+        if symlink:
+            out = tmp_path / "link"
+            out.symlink_to(fifo)
+
+        def refuse_open(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("the writability probe opened a FIFO")
+
+        access: list[tuple[Path, int]] = []
+
+        def can_write(path: Path, mode: int) -> bool:
+            access.append((path, mode))
+            return writable
+
+        monkeypatch.setattr(bench, "open", refuse_open, raising=False)
+        monkeypatch.setattr(bench.os, "access", can_write)
+        if writable:
+            bench.check_writable(out)
+        else:
+            message = f"out {str(out)!r} cannot be written: {os.strerror(errno.EACCES)}."
+            with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+                bench.check_writable(out)
+        assert access == [(out, os.W_OK)]
+
+    @pytest.mark.may_skip
+    @pytest.mark.skipif(os.name != "posix", reason="requires a POSIX null device")
+    def test_a_device_is_checked_without_opening_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def refuse_open(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("the writability probe opened a device")
+
+        monkeypatch.setattr(bench, "open", refuse_open, raising=False)
+        bench.check_writable(os.devnull)
+
+    @pytest.mark.may_skip
+    def test_a_250_byte_filename_is_accepted(self, tmp_path: Path) -> None:
+        out = tmp_path / ("a" * 250)
+        # Verify that this filesystem supports the name before testing the probe.
+        try:
+            out.touch()
+        except OSError as error:
+            if error.errno == errno.ENAMETOOLONG:
+                pytest.skip("the filesystem does not support a 250-byte basename")
+            raise
+        out.unlink()
+        bench.check_writable(out)
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize("name", ["a" * 15, "a" * 16, "a" * 17, "é" * 9])
+    def test_the_filename_limit_counts_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        def pathconf(path: Path, key: str) -> int:
+            assert path == tmp_path
+            assert key == "PC_NAME_MAX"
+            return 16
+
+        monkeypatch.setattr(bench.os, "pathconf", pathconf, raising=False)
+        out = tmp_path / name
+        if len(os.fsencode(name)) <= 16:
+            bench.check_writable(out)
+        else:
+            message = f"out {str(out)!r} cannot be written: {os.strerror(errno.ENAMETOOLONG)}."
+            with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+                bench.check_writable(out)
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "limit", [None, OSError(errno.EIO, "unsupported"), ValueError(), -1, 0]
+    )
+    def test_an_unavailable_filename_limit_still_probes_the_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: Exception | int | None
+    ) -> None:
+        def pathconf(path: Path, key: str) -> int:
+            if isinstance(limit, Exception):
+                raise limit
+            assert isinstance(limit, int)
+            return limit
+
+        if limit is None:
+            monkeypatch.delattr(bench.os, "pathconf", raising=False)
+        else:
+            monkeypatch.setattr(bench.os, "pathconf", pathconf, raising=False)
+        bench.check_writable(tmp_path / "new.jsonl")
+        assert list(tmp_path.iterdir()) == []
+        with pytest.raises(ValueError, match="cannot be written"):
+            bench.check_writable(tmp_path / "missing" / "new.jsonl")
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestCommandLine:
