@@ -2168,6 +2168,213 @@ class TestCache:
         for line, record in zip(bench.read_records(tmp_path / "b.jsonl"), second, strict=True):
             assert line["tuning"] == record["tuning"]
 
+    def test_prune_removes_entries_under_another_code_digest_and_keeps_current_entries(
+        self, tmp_path: Path
+    ) -> None:
+        """Pruning deletes entries of other code and leaves current entries intact (#575)."""
+        compute, _ = self._counting()
+        config1 = {"config": _map_by_hand(4, 1.0, 0.0, 1).get_config()}
+        config2 = {"config": _map_by_hand(4, 3.0, 0.0, 1).get_config()}
+
+        # One entry written under other code digest, one written under current code
+        other_code = "0" * 64
+        cache_other = bench.FeatureCache(tmp_path, code_sha256=other_code)
+        entry_other = cache_other.fetch(self.inputs, self.labels, config1, compute)
+        assert entry_other.hit is False
+
+        cache_current = bench.FeatureCache(tmp_path)
+        entry_current = cache_current.fetch(self.inputs, self.labels, config2, compute)
+        assert entry_current.hit is False
+
+        entries_before = list(tmp_path.glob("*.npz"))
+        assert len(entries_before) == 2
+        path_other = cache_other.path(self.inputs, self.labels, config1)
+        path_current = cache_current.path(self.inputs, self.labels, config2)
+        assert path_other is not None and path_current is not None
+        stale_size = path_other.stat().st_size
+
+        report = cache_current.prune()
+        assert report.files == 1
+        assert report.bytes == stale_size
+        assert report.unreadable == ()
+
+        assert not path_other.exists()
+        assert path_current.exists()
+
+        # The kept entry is still a hit
+        hit = cache_current.fetch(self.inputs, self.labels, config2, compute)
+        assert hit.hit is True
+        np.testing.assert_array_equal(hit.features, entry_current.features)
+
+    def test_prune_removes_entries_under_another_environment(self, tmp_path: Path) -> None:
+        """Pruning deletes entries whose key_environment differs (#575)."""
+        compute, _ = self._counting()
+        config1 = {"config": _map_by_hand(4, 1.0, 0.0, 1).get_config()}
+        config2 = {"config": _map_by_hand(4, 3.0, 0.0, 1).get_config()}
+
+        env = environment()
+        other_env = {**env, "packages": {**env["packages"], "torch": "0.0.0+other"}}
+        cache_other = bench.FeatureCache(tmp_path, env=other_env)
+        cache_other.fetch(self.inputs, self.labels, config1, compute)
+
+        cache_current = bench.FeatureCache(tmp_path)
+        cache_current.fetch(self.inputs, self.labels, config2, compute)
+
+        path_other = cache_other.path(self.inputs, self.labels, config1)
+        path_current = cache_current.path(self.inputs, self.labels, config2)
+        assert path_other is not None and path_current is not None
+        stale_size = path_other.stat().st_size
+
+        report = cache_current.prune()
+        assert report.files == 1
+        assert report.bytes == stale_size
+        assert not path_other.exists()
+        assert path_current.exists()
+
+        hit = cache_current.fetch(self.inputs, self.labels, config2, compute)
+        assert hit.hit is True
+
+    def test_prune_preserves_entries_whose_platform_alone_differs(self, tmp_path: Path) -> None:
+        """Entries from another platform share key_environment and are preserved (#575)."""
+        compute, _ = self._counting()
+        config = {"config": _map_by_hand(4, 1.0, 0.0, 1).get_config()}
+
+        env = environment()
+        elsewhere = {**env, "platform": "Elsewhere-1.0-riscv64"}
+        cache_elsewhere = bench.FeatureCache(tmp_path, env=elsewhere)
+        entry = cache_elsewhere.fetch(self.inputs, self.labels, config, compute)
+        assert entry.hit is False
+
+        cache_current = bench.FeatureCache(tmp_path)
+        path = cache_current.path(self.inputs, self.labels, config)
+        assert path is not None and path.exists()
+
+        report = cache_current.prune()
+        assert report.files == 0
+        assert report.bytes == 0
+        assert report.unreadable == ()
+        assert path.exists()
+
+        # The entry is still a hit for the running process
+        hit = cache_current.fetch(self.inputs, self.labels, config, compute)
+        assert hit.hit is True
+
+    def test_prune_leaves_unreadable_legacy_and_partial_files_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """Files that cannot be read as valid entries are reported, not removed (#575)."""
+        compute, _ = self._counting()
+        config = {"config": _map_by_hand(4, 1.0, 0.0, 1).get_config()}
+        cache = bench.FeatureCache(tmp_path)
+        cache.fetch(self.inputs, self.labels, config, compute)
+
+        # Legacy entry without code_sha256 or environment (pre-#543)
+        legacy_path = tmp_path / "legacy.npz"
+        np.savez(legacy_path, features=np.full((12, 4), 1.0), seconds=np.float64(0.5))
+
+        # Partial file
+        part_path = tmp_path / "in_flight.part"
+        part_path.write_bytes(b"partial content")
+
+        # Corrupt npz file
+        corrupt_path = tmp_path / "corrupt.npz"
+        corrupt_path.write_bytes(b"not a valid zip file")
+
+        # Zero-byte npz file
+        empty_npz_path = tmp_path / "empty.npz"
+        empty_npz_path.touch()
+
+        # Non-npz file
+        txt_path = tmp_path / "notes.txt"
+        txt_path.write_bytes(b"some notes")
+
+        report = cache.prune()
+        assert report.files == 0
+        assert report.bytes == 0
+        assert set(report.unreadable) == {
+            legacy_path,
+            part_path,
+            corrupt_path,
+            empty_npz_path,
+            txt_path,
+        }
+
+        # All files still exist
+        assert legacy_path.exists()
+        assert part_path.exists()
+        assert corrupt_path.exists()
+        assert empty_npz_path.exists()
+        assert txt_path.exists()
+        assert cache.fetch(self.inputs, self.labels, config, compute).hit is True
+
+    def test_prune_empty_or_nonexistent_or_disabled_directory(self, tmp_path: Path) -> None:
+        """prune() handles None, nonexistent, or empty directories cleanly (#575)."""
+        assert bench.FeatureCache(None).prune() == bench.PruneReport(0, 0, ())
+        assert bench.FeatureCache(tmp_path / "empty").prune() == bench.PruneReport(0, 0, ())
+        cache_missing = bench.FeatureCache(tmp_path / "missing")
+        (tmp_path / "missing").rmdir()
+        assert cache_missing.prune() == bench.PruneReport(0, 0, ())
+
+    def test_prune_removes_stale_entry_with_obsolete_environment_schema(
+        self, tmp_path: Path
+    ) -> None:
+        """Entries under another code digest are pruned even with an obsolete environment (#575)."""
+        cache = bench.FeatureCache(tmp_path)
+        stale_path = tmp_path / "stale_obsolete.npz"
+        np.savez(
+            stale_path,
+            features=np.full((12, 4), 1.0),
+            seconds=np.float64(0.5),
+            code_sha256=np.array("0" * 64),
+            environment=np.array(json.dumps({"obsolete_schema": True})),
+        )
+        report = cache.prune()
+        assert report.files == 1
+        assert not stale_path.exists()
+        assert report.unreadable == ()
+
+    def test_prune_cli_option(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--prune-cache removes stale entries and exits without running the benchmark (#575)."""
+        compute, _ = self._counting()
+        config_stale = {"config": _map_by_hand(4, 1.0, 0.0, 1).get_config()}
+        config_current = {"config": _map_by_hand(4, 3.0, 0.0, 1).get_config()}
+        cache_dir = tmp_path / "cache"
+
+        # Stale entry under another code digest
+        cache_other = bench.FeatureCache(cache_dir, code_sha256="1" * 64)
+        cache_other.fetch(self.inputs, self.labels, config_stale, compute)
+        path_stale = cache_other.path(self.inputs, self.labels, config_stale)
+        assert path_stale is not None and path_stale.exists()
+        stale_size = path_stale.stat().st_size
+
+        # Current valid entry
+        cache_current = bench.FeatureCache(cache_dir)
+        cache_current.fetch(self.inputs, self.labels, config_current, compute)
+        path_current = cache_current.path(self.inputs, self.labels, config_current)
+        assert path_current is not None and path_current.exists()
+
+        assert len(list(cache_dir.glob("*.npz"))) == 2
+
+        out_file = tmp_path / "out.jsonl"
+        records = bench.main(
+            ["--quick", "--prune-cache", "--cache-dir", str(cache_dir), "--out", str(out_file)]
+        )
+
+        assert records == []
+        assert not out_file.exists()
+        assert not path_stale.exists()
+        assert path_current.exists()
+        assert cache_current.fetch(self.inputs, self.labels, config_current, compute).hit is True
+
+        captured = capsys.readouterr().out
+        assert f"pruned cache ({cache_dir}): removed 1 file ({stale_size} bytes)" in captured
+        assert "wrote" not in captured
+
+    def test_prune_cli_conflicts_with_no_cache(self, tmp_path: Path) -> None:
+        """--prune-cache cannot be combined with --no-cache (#575)."""
+        with pytest.raises(SystemExit):
+            bench.main(["--no-cache", "--prune-cache", "--out", str(tmp_path / "out.jsonl")])
+
 
 # ---------------------------------------------------------------------------
 # Standardising a feature matrix (#518)
