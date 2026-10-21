@@ -554,6 +554,17 @@ def test_sampling_only_device_without_device_shots_rejection_and_sampled_executi
     x = torch.rand(2, in_features)
     with torch.no_grad():
         torch.testing.assert_close(sampled(x), exact(x), atol=0.05, rtol=0)
+    original = sampled.qlayer.qnode
+    with pytest.raises(ValueError, match="does not support analytic execution"):
+        with apply_shots(sampled, None):
+            pytest.fail("the block must not start")
+    assert sampled.qlayer.qnode is original
+    monkeypatch.setattr(
+        sampled, "predict_proba", lambda _: pytest.fail("prediction ran"), raising=False
+    )
+    with pytest.raises(ValueError, match="does not support analytic execution"):
+        shot_sweep(sampled, x, [100, None])
+    assert sampled.qlayer.qnode is original
 
 
 @pytest.mark.requires_lightning
