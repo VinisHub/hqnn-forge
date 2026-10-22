@@ -1439,10 +1439,11 @@ def shot_sweep(
     Raises
     ------
     ValueError
-        If ``n_repeats < 1``, only one of ``y`` and ``score_fn`` is given, or a
-        shot count is invalid -- checked before the first evaluation.
+        If ``n_repeats < 1``, only one of ``y`` and ``score_fn`` is given, a
+        shot count is invalid, or ``shots`` contains ``None`` and the device
+        cannot execute without shots -- checked before the first evaluation.
     TypeError
-        If ``model`` has no ``predict_proba``.
+        If ``model`` has no ``predict_proba`` or no quantum layer.
     """
     from hqnn_forge.encoding._common import validate_device_shots, validate_shots
 
@@ -1458,8 +1459,9 @@ def shot_sweep(
     counts = list(shots)
     for count in counts:
         validate_shots(count, "parameter-shift")
+    if None in counts:
         _, qlayer, _ = resolve_encoding_layer(model, "shot_sweep")
-        validate_device_shots(qlayer.qnode.device, count)
+        validate_device_shots(qlayer.qnode.device, None)
     points = []
     for count in counts:
         with apply_shots(model, count):
