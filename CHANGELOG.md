@@ -533,6 +533,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same way (#651)
 
 ### Fixed
+- `examples/benchmark_rydberg_features.py` uses a pairwise-summation bound for every
+  standardised column in steps 2 and 4: at 150 fitting rows, a `½ + 2⁻⁵²g` column is only
+  centred up to about 16 units in the last place, rather than the old bound's 150, so raw
+  inputs and strong-dephasing results can differ from earlier runs; result lines also list
+  columns only centred despite nonzero computed variance (#682)
 - `examples/benchmark.py` refuses `--max-rows` below 2, `--folds` below 2, `--qubits` below 2,
   and `--epochs`, `--layers` or `--seeds` below 1 with a usage error before any data is loaded,
   instead of failing later with a traceback (#661, #669)
