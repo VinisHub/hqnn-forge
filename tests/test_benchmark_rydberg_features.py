@@ -1737,8 +1737,8 @@ class TestInputs:
 
         X, _ = self._data()
         rows = np.arange(0, 90)
-        # ``StandardScaler`` has the constant rule of ``standardise_features``
-        # (#580): a variance within its rounding bound is only centred.
+        # These columns have enough variation that the tighter bound of
+        # ``standardise_features`` and ``StandardScaler`` agree (#580).
         scaled = StandardScaler().fit(X[rows]).transform(X)
         centred = scaled[rows] - scaled[rows].mean(0)
         values, vectors = np.linalg.eigh(np.cov(centred, rowvar=False))
@@ -1757,7 +1757,7 @@ class TestInputs:
         written out so they depend on no random stream or summation order:
         a σ of about ``1e-16``, not 0, and a variance (about ``1e-32``) below
         the rounding bound of :func:`standardise_features`
-        (``(n ε μ)² ≈ 2.5e-27`` for 150 rows).
+        (``(2 ceil(log2(n)) ε μ)² ≈ 3e-29`` for 150 rows).
         The other three columns, standardised, span a plane plus a direction
         of variance ``2.4e-5``, so with three components the third is that
         small direction.  The rounding noise, scaled to unit variance by the
@@ -2964,6 +2964,35 @@ def _collapsed(epsilon: float, n_synthetic: int = 8) -> tuple[Any, np.ndarray, n
 
 
 class TestStandardiseFeatures:
+    def test_large_mean_with_real_variation_is_scaled(self) -> None:
+        rows = np.arange(5000)
+        values = 1e9 + np.where(rows % 2 == 0, -1e-4, 1e-4)
+        features = values[:, None]
+        assert 0 < values.std() < rows.size * np.finfo(np.float64).eps * abs(values.mean())
+        assert values.var() <= (rows.size * np.finfo(np.float64).eps * values.mean()) ** 2
+        result = bench.standardise_features(features, rows)
+        np.testing.assert_allclose(result.std(), 1.0, rtol=1e-12)
+        assert bench._centred_constant_columns(features, rows) == []
+
+    def test_the_column_means_are_summed_pairwise(self) -> None:
+        # 5000 copies of one float64 next to a second column: summed row by row,
+        # the mean of column 0 is off by about 1.8e-5, above the pairwise bound,
+        # and the column would be scaled to -1 instead of only centred.
+        rows = np.arange(5000)
+        features = np.column_stack([np.full(rows.size, 1e9 + 1 / 3), rows.astype(float)])
+        result = bench.standardise_features(features, rows)
+        np.testing.assert_array_equal(result[:, 0], 0.0)
+
+    def test_large_mean_float64_neighbours_are_only_centred_and_reported(self) -> None:
+        rows = np.arange(5000)
+        mean = 1e9
+        neighbours = mean + np.where(rows % 2 == 0, 0.0, np.spacing(mean))
+        features = neighbours[:, None]
+        assert neighbours.std() > 0
+        result = bench.standardise_features(features, rows)
+        np.testing.assert_array_equal(result[:, 0], neighbours - neighbours.mean())
+        assert bench._centred_constant_columns(features, rows) == [0]
+
     def test_a_matrix_by_hand(self) -> None:
         # Column 0 on the fitting rows: 1, 2, 3, so μ = 2 and σ² = (1 + 0 + 1)/3.
         # Column 1 is constant there and is only centred.
@@ -2987,6 +3016,10 @@ class TestStandardiseFeatures:
 
     def test_rows_outside_the_fit_change_no_other_row(self) -> None:
         split, features, fit_rows = _collapsed(0.01)
+        features = features.copy()
+        scale = np.array([0.125, 0.0625, 0.03125, 0.015625])
+        signs = 2 * (np.arange(fit_rows.size) % 2) - 1
+        features[fit_rows] = 0.5 + signs[:, None] * scale
         before = bench.standardise_features(features, fit_rows)
         # Synthetic, validation and test rows: none of them is a fitting row.
         outside = np.setdiff1d(np.arange(features.shape[0]), fit_rows)
@@ -2995,7 +3028,8 @@ class TestStandardiseFeatures:
         changed[outside] = 0.5 + 7.0 * (changed[outside] - 0.5)
         after = bench.standardise_features(changed, fit_rows)
         np.testing.assert_array_equal(after[fit_rows], before[fit_rows])
-        mean, std = features[fit_rows].mean(axis=0), features[fit_rows].std(axis=0)
+        columns = np.ascontiguousarray(features[fit_rows].T)
+        mean, std = columns.mean(axis=1), columns.std(axis=1)
         np.testing.assert_allclose(after[outside], (changed[outside] - mean) / std, rtol=1e-12)
         assert np.abs(after[outside] - before[outside]).max() > 1.0
         # A fitting row does enter: the same change there moves every row.
@@ -3032,7 +3066,8 @@ class TestStandardiseFeatures:
     def test_a_column_constant_up_to_rounding_is_only_centred(self) -> None:
         """
         ½ and ½ ± one unit in the last place (2⁻⁵³): a computed variance of
-        about 8e-33, below the rounding bound ``(n ε |μ|)² ≈ 2.8e-28`` for
+        about 8e-33, below the rounding bound
+        ``(2 ceil(log2(n)) ε |μ|)² ≈ 3.2e-30`` for
         150 rows, so the column is only centred, as scikit-learn's
         ``StandardScaler`` treats it; divided by its σ it would be ±1.2.
         """
@@ -3671,6 +3706,8 @@ FIELDS = {
     "n_samples",
     "n_positives",
     "n_raw_features",
+    "raw_constant_columns",
+    "feature_constant_columns",
     "arm",
     "head",
     "representation",
@@ -3716,6 +3753,18 @@ FIELDS = {
 
 @pytest.mark.slow
 class TestQuick:
+    def test_raw_rounding_column_is_listed_in_result_line(self) -> None:
+        settings = _replace(QUICK, arms=("C",), n_trials=0, max_epochs=1)
+        X, y, _ = bench.load_dataset("positive-control", settings)
+        X[:, 0] = 1e9 + np.where(np.arange(X.shape[0]) % 2 == 0, 0.0, np.spacing(1e9))
+        records = list(
+            bench.run_dataset("positive-control", X, y, settings, bench.FeatureCache(None))
+        )
+        assert records
+        for record in records:
+            assert 0 in record["raw_constant_columns"]
+            assert 0 in json.loads(bench.to_json_line(record))["raw_constant_columns"]
+
     def test_one_line_per_arm_and_head_of_one_fold_and_one_grid_point(self, quick: Any) -> None:
         assert [(r["arm"], r["head"]) for r in quick.lines] == ROWS
         assert {r["fold"] for r in quick.lines} == {0}
@@ -3729,6 +3778,23 @@ class TestQuick:
         assert len(lines) == len(ROWS)
         for line, record in zip(lines, quick.lines, strict=True):
             assert set(_strict_loads(line)) == FIELDS == set(record)
+            assert record["raw_constant_columns"] == bench._centred_constant_columns(
+                quick.X, quick.fold.train_part
+            )
+            assert record["feature_constant_columns"] == [] or all(
+                0 <= column < record["feature_dim"]
+                for column in record["feature_constant_columns"]
+            )
+            tuning = record["tuning"]
+            assert tuning["raw_constant_columns"] == [
+                bench._centred_constant_columns(quick.X, quick.fold.train_part[fit])
+                for fit, _ in bench.stratified_kfold(
+                    quick.y[quick.fold.train_part],
+                    QUICK.inner_folds,
+                    random_state=quick.fold.seeds["tune_seed"],
+                )
+            ]
+            assert len(tuning["feature_constant_columns"]) == QUICK.inner_folds
 
     def test_every_arm_has_the_same_fold_rows_and_seeds(self, quick: Any) -> None:
         """Compared between the lines, and against the fold rebuilt by hand."""

@@ -536,6 +536,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `apply_shots(model, None)` and a `shot_sweep` with `None` in `shots` raise the same
   `ValueError` as layer construction on a sampling-only device, before any QNode is swapped
   or any prediction runs, instead of PennyLane's `DeviceError` at the first forward pass (#684)
+- `examples/benchmark_rydberg_features.py` uses a pairwise-summation bound for every
+  standardised column in steps 2 and 4: at 150 fitting rows, a `½ + 2⁻⁵²g` column is only
+  centred up to about 16 units in the last place, rather than the old bound's 150, so raw
+  inputs and strong-dephasing results can differ from earlier runs; result lines also list
+  columns only centred despite nonzero computed variance (#682)
+- `examples/benchmark.py` refuses `--max-rows` below 2, `--folds` below 2, `--qubits` below 2,
+  and `--epochs`, `--layers` or `--seeds` below 1 with a usage error before any data is loaded,
+  instead of failing later with a traceback (#661, #669)
 - `examples/benchmark_rydberg_features.py --prune-cache` refuses a `--cache-dir` that is not an
   existing directory instead of creating it and reporting an empty prune, says why when the
   code digest is unavailable, and ignores every other option (an invalid `--patience` no longer
